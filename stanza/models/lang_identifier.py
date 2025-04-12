@@ -1,5 +1,10 @@
+#!/usr/bin/env python3
 """
-Entry point for training and evaluating a Bi-LSTM language identifier
+Enhanced Bi-LSTM Language Identification System
+- Modular architecture
+- Mixed precision training
+- Comprehensive metrics
+- Reproducibility features
 """
 
 import argparse
@@ -7,230 +12,314 @@ import json
 import logging
 import os
 import random
-import torch
-
 from datetime import datetime
-from stanza.models.common import utils
-from stanza.models.langid.data import DataLoader
-from stanza.models.langid.trainer import Trainer
-from stanza.utils.get_tqdm import get_tqdm
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
-tqdm = get_tqdm()
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.metrics import classification_report
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, Dataset, random_split
+from tqdm import tqdm
 
-logger = logging.getLogger('stanza')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('stanza.langid')
 
-def parse_args(args=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_mode", help="custom settings when running in batch mode", action="store_true")
-    parser.add_argument("--batch_size", help="batch size for training", type=int, default=64)
-    parser.add_argument("--eval_length", help="length of strings to eval on", type=int, default=None)
-    parser.add_argument("--eval_set", help="eval on dev or test", default="test")
-    parser.add_argument("--data_dir", help="directory with train/dev/test data", default=None)
-    parser.add_argument("--load_name", help="path to load model from", default=None)
-    parser.add_argument("--mode", help="train or eval", default="train")
-    parser.add_argument("--num_epochs", help="number of epochs for training", type=int, default=50)
-    parser.add_argument("--randomize", help="take random substrings of samples", action="store_true")
-    parser.add_argument("--randomize_lengths_range", help="range of lengths to use when random sampling text",
-                        type=randomize_lengths_range, default="5,20")
-    parser.add_argument("--merge_labels_for_eval",
-                        help="merge some language labels for eval (e.g. \"zh-hans\" and \"zh-hant\" to \"zh\")", 
-                        action="store_true")
-    parser.add_argument("--save_best_epochs", help="save model for every epoch with new best score", action="store_true")
-    parser.add_argument("--save_name", help="where to save model", default=None)
-    utils.add_device_args(parser)
-    args = parser.parse_args(args=args)
-    return args
+class LanguageDataset(Dataset):
+    """Improved data loading and preprocessing"""
+    def __init__(self, data_dir: str, split: str = 'train', max_length: int = 100):
+        self.data = self._load_data(data_dir, split)
+        self.char_to_idx, self.tag_to_idx = self._build_vocab()
+        self.max_length = max_length
 
-
-def randomize_lengths_range(range_list):
-    """
-    Range of lengths for random samples
-    """
-    range_boundaries = [int(x) for x in range_list.split(",")]
-    assert range_boundaries[0] < range_boundaries[1], f"Invalid range: ({range_boundaries[0]}, {range_boundaries[1]})"
-    return range_boundaries
-
-
-def main(args=None):
-    args = parse_args(args=args)
-    torch.manual_seed(0)
-    if args.mode == "train":
-        train_model(args)
-    else:
-        eval_model(args)
-
-
-def build_indexes(args):
-    tag_to_idx = {}
-    char_to_idx = {}
-    train_files = [f"{args.data_dir}/{x}" for x in os.listdir(args.data_dir) if "train" in x]
-    for train_file in train_files:
-        with open(train_file) as curr_file:
-            lines = curr_file.read().strip().split("\n")
-        examples = [json.loads(line) for line in lines if line.strip()]
-        for example in examples:
-            label = example["label"]
-            if label not in tag_to_idx:
-                tag_to_idx[label] = len(tag_to_idx)
-            sequence = example["text"]
-            for char in list(sequence):
-                if char not in char_to_idx:
-                    char_to_idx[char] = len(char_to_idx)
-    char_to_idx["UNK"] = len(char_to_idx)
-    char_to_idx["<PAD>"] = len(char_to_idx)
-
-    return tag_to_idx, char_to_idx
-
-
-def train_model(args):
-    # set up indexes
-    tag_to_idx, char_to_idx = build_indexes(args)
-    # load training data
-    train_data = DataLoader(args.device)
-    train_files = [f"{args.data_dir}/{x}" for x in os.listdir(args.data_dir) if "train" in x]
-    train_data.load_data(args.batch_size, train_files, char_to_idx, tag_to_idx, args.randomize)
-    # load dev data
-    dev_data = DataLoader(args.device)
-    dev_files = [f"{args.data_dir}/{x}" for x in os.listdir(args.data_dir) if "dev" in x]
-    dev_data.load_data(args.batch_size, dev_files, char_to_idx, tag_to_idx, randomize=False, 
-                       max_length=args.eval_length)
-    # set up trainer
-    trainer_config = {
-        "model_path": args.save_name,
-        "char_to_idx": char_to_idx,
-        "tag_to_idx": tag_to_idx,
-        "batch_size": args.batch_size,
-        "lang_weights": train_data.lang_weights
-    }
-    if args.load_name:
-        trainer_config["load_name"] = args.load_name
-        logger.info(f"{datetime.now()}\tLoading model from: {args.load_name}")
-    trainer = Trainer(trainer_config, load_model=args.load_name is not None, device=args.device)
-    # run training
-    best_accuracy = 0.0
-    for epoch in range(1, args.num_epochs+1):
-        logger.info(f"{datetime.now()}\tEpoch {epoch}")
-        logger.info(f"{datetime.now()}\tNum training batches: {len(train_data.batches)}")
-
-        batches = train_data.batches
-        if not args.batch_mode:
-            batches = tqdm(batches)
-        for train_batch in batches:
-            inputs = (train_batch["sentences"], train_batch["targets"])
-            trainer.update(inputs)
-
-        logger.info(f"{datetime.now()}\tEpoch complete. Evaluating on dev data.")
-        curr_dev_accuracy, curr_confusion_matrix, curr_precisions, curr_recalls, curr_f1s = \
-            eval_trainer(trainer, dev_data, batch_mode=args.batch_mode)
-        logger.info(f"{datetime.now()}\tCurrent dev accuracy: {curr_dev_accuracy}")
-        if curr_dev_accuracy > best_accuracy:
-            logger.info(f"{datetime.now()}\tNew best score. Saving model.")
-            model_label = f"epoch{epoch}" if args.save_best_epochs else None
-            trainer.save(label=model_label)
-            with open(score_log_path(args.save_name), "w") as score_log_file:
-                for score_log in [{"dev_accuracy": curr_dev_accuracy}, curr_confusion_matrix, curr_precisions,
-                                  curr_recalls, curr_f1s]:
-                    score_log_file.write(json.dumps(score_log) + "\n")
-            best_accuracy = curr_dev_accuracy
-
-        # reload training data
-        logger.info(f"{datetime.now()}\tResampling training data.")
-        train_data.load_data(args.batch_size, train_files, char_to_idx, tag_to_idx, args.randomize)
-
-
-def score_log_path(file_path):
-    """
-    Helper that will determine corresponding log file (e.g. /path/to/demo.pt to /path/to/demo.json
-    """
-    model_suffix = os.path.splitext(file_path)
-    if model_suffix[1]:
-        score_log_path = f"{file_path[:-len(model_suffix[1])]}.json"
-    else:
-        score_log_path = f"{file_path}.json"
-    return score_log_path
-
-
-def eval_model(args):
-    # set up trainer
-    trainer_config = {
-        "model_path": None,
-        "load_name": args.load_name,
-        "batch_size": args.batch_size
-    }
-    trainer = Trainer(trainer_config, load_model=True, device=args.device)
-    # load test data
-    test_data = DataLoader(args.device)
-    test_files = [f"{args.data_dir}/{x}" for x in os.listdir(args.data_dir) if args.eval_set in x]
-    test_data.load_data(args.batch_size, test_files, trainer.model.char_to_idx, trainer.model.tag_to_idx, 
-                        randomize=False, max_length=args.eval_length)
-    curr_accuracy, curr_confusion_matrix, curr_precisions, curr_recalls, curr_f1s = \
-        eval_trainer(trainer, test_data, batch_mode=args.batch_mode, fine_grained=not args.merge_labels_for_eval)
-    logger.info(f"{datetime.now()}\t{args.eval_set} accuracy: {curr_accuracy}")
-    eval_save_path = args.save_name if args.save_name else score_log_path(args.load_name)
-    if not os.path.exists(eval_save_path) or args.save_name:
-        with open(eval_save_path, "w") as score_log_file:
-            for score_log in [{"dev_accuracy": curr_accuracy}, curr_confusion_matrix, curr_precisions,
-                              curr_recalls, curr_f1s]:
-                score_log_file.write(json.dumps(score_log) + "\n")
+    def _load_data(self, data_dir: str, split: str) -> List[dict]:
+        """Load and validate data files"""
+        files = [f for f in Path(data_dir).glob(f'*{split}*') if f.is_file()]
+        if not files:
+            raise FileNotFoundError(f"No {split} files found in {data_dir}")
         
+        data = []
+        for file in files:
+            with open(file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        data.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON in {file}: {line.strip()}")
+        return data
 
+    def _build_vocab(self) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Build character and language vocabularies"""
+        chars = set()
+        tags = set()
+        
+        for item in self.data:
+            chars.update(item['text'])
+            tags.add(item['label'])
+        
+        char_to_idx = {c: i+2 for i, c in enumerate(chars)}  # 0: pad, 1: unk
+        char_to_idx['<PAD>'] = 0
+        char_to_idx['<UNK>'] = 1
+        
+        tag_to_idx = {t: i for i, t in enumerate(sorted(tags))}
+        
+        return char_to_idx, tag_to_idx
 
-def eval_trainer(trainer, dev_data, batch_mode=False, fine_grained=True):
-    """
-    Produce dev accuracy and confusion matrix for a trainer
-    """
+    def __len__(self) -> int:
+        return len(self.data)
 
-    # set up confusion matrix
-    tag_to_idx = dev_data.tag_to_idx
-    idx_to_tag = dev_data.idx_to_tag
-    confusion_matrix = {}
-    for row_label in tag_to_idx:
-        confusion_matrix[row_label] = {}
-        for col_label in tag_to_idx:
-            confusion_matrix[row_label][col_label] = 0
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        item = self.data[idx]
+        text = item['text'][:self.max_length]
+        label = item['label']
+        
+        # Convert to indices
+        char_indices = [self.char_to_idx.get(c, self.char_to_idx['<UNK>']) for c in text]
+        label_idx = self.tag_to_idx[label]
+        
+        # Padding
+        padded = torch.zeros(self.max_length, dtype=torch.long)
+        padded[:len(char_indices)] = torch.tensor(char_indices)
+        
+        return padded, torch.tensor(label_idx)
 
-    # process dev batches
-    batches = dev_data.batches
-    if not batch_mode:
-        batches = tqdm(batches)
-    for dev_batch in batches:
-        inputs = (dev_batch["sentences"], dev_batch["targets"])
-        predictions = trainer.predict(inputs)
-        for target_idx, prediction in zip(dev_batch["targets"], predictions):
-            prediction_label = idx_to_tag[prediction] if fine_grained else idx_to_tag[prediction].split("-")[0]
-            confusion_matrix[idx_to_tag[target_idx]][prediction_label] += 1
+class BiLSTMLanguageID(nn.Module):
+    """Enhanced model architecture"""
+    def __init__(self, config: dict):
+        super().__init__()
+        self.config = config
+        
+        # Embedding layer
+        self.embedding = nn.Embedding(
+            num_embeddings=config['vocab_size'],
+            embedding_dim=config['embed_dim'],
+            padding_idx=0
+        )
+        
+        # BiLSTM layer
+        self.lstm = nn.LSTM(
+            input_size=config['embed_dim'],
+            hidden_size=config['hidden_dim'],
+            num_layers=config['num_layers'],
+            bidirectional=True,
+            batch_first=True
+        )
+        
+        # Classifier
+        self.fc = nn.Linear(2 * config['hidden_dim'], config['num_classes'])
+        self.dropout = nn.Dropout(config['dropout'])
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        embedded = self.dropout(self.embedding(x))
+        lstm_out, _ = self.lstm(embedded)
+        pooled = lstm_out.mean(dim=1)  # Mean pooling
+        return self.fc(self.dropout(pooled))
 
-    # calculate dev accuracy
-    total_examples = sum([sum([confusion_matrix[i][j] for j in confusion_matrix[i]]) for i in confusion_matrix])
-    total_correct = sum([confusion_matrix[i][i] for i in confusion_matrix])
-    dev_accuracy = float(total_correct) / float(total_examples)
+class Trainer:
+    """Enhanced training loop with AMP and early stopping"""
+    def __init__(self, config: dict):
+        self.config = config
+        self.device = torch.device(config['device'])
+        
+        # Initialize model
+        self.model = BiLSTMLanguageID(config).to(self.device)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config['lr'],
+            weight_decay=config['weight_decay']
+        )
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max', patience=3
+        )
+        self.scaler = GradScaler(enabled=config['use_amp'])
+        
+        # Loss function with class weights
+        self.criterion = nn.CrossEntropyLoss(
+            weight=torch.tensor(config['class_weights'], device=self.device),
+            label_smoothing=config['label_smoothing']
+        )
+        
+        # Track best metric
+        self.best_accuracy = 0.0
+        self.early_stop_counter = 0
 
-    # calculate precision, recall, F1
-    precision_scores = {"type": "precision"}
-    recall_scores = {"type": "recall"}
-    f1_scores = {"type": "f1"}
-    for prediction_label in tag_to_idx:
-        total = sum([confusion_matrix[k][prediction_label] for k in tag_to_idx])
-        if total != 0.0:
-            precision_scores[prediction_label] = float(confusion_matrix[prediction_label][prediction_label])/float(total)
+    def train_epoch(self, train_loader: DataLoader) -> float:
+        self.model.train()
+        total_loss = 0.0
+        
+        for batch in tqdm(train_loader, desc="Training"):
+            inputs, labels = batch
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
+            
+            self.optimizer.zero_grad()
+            
+            with autocast(enabled=self.config['use_amp']):
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, labels)
+            
+            self.scaler.scale(loss).backward()
+            if self.config['grad_clip'] > 0:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.config['grad_clip'])
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
+            total_loss += loss.item()
+        
+        return total_loss / len(train_loader)
+
+    def evaluate(self, eval_loader: DataLoader) -> Tuple[float, dict]:
+        self.model.eval()
+        all_preds, all_labels = [], []
+        total_loss = 0.0
+        
+        with torch.no_grad():
+            for batch in tqdm(eval_loader, desc="Evaluating"):
+                inputs, labels = batch
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, labels)
+                total_loss += loss.item()
+                
+                preds = outputs.argmax(dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        # Calculate metrics
+        accuracy = (np.array(all_preds) == np.array(all_labels)).mean()
+        report = classification_report(
+            all_labels, all_preds,
+            target_names=list(self.config['idx_to_tag'].values()),
+            output_dict=True
+        )
+        
+        return accuracy, report, total_loss / len(eval_loader)
+
+    def save_checkpoint(self, path: str, is_best: bool = False):
+        """Save model checkpoint"""
+        state = {
+            'model_state': self.model.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'scaler_state': self.scaler.state_dict(),
+            'config': self.config,
+            'best_accuracy': self.best_accuracy
+        }
+        torch.save(state, path)
+        if is_best:
+            best_path = str(Path(path).with_name('model_best.pt'))
+            torch.save(state, best_path)
+
+def main():
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='BiLSTM Language Identification')
+    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing train/dev/test files')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training')
+    parser.add_argument('--max_length', type=int, default=100, help='Maximum sequence length')
+    parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension')
+    parser.add_argument('--hidden_dim', type=int, default=256, help='LSTM hidden dimension')
+    parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM layers')
+    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--patience', type=int, default=5, help='Early stopping patience')
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
+    parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing')
+    parser.add_argument('--use_amp', action='store_true', help='Use mixed precision training')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    args = parser.parse_args()
+
+    # Set random seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # Load datasets
+    train_dataset = LanguageDataset(args.data_dir, 'train', args.max_length)
+    dev_dataset = LanguageDataset(args.data_dir, 'dev', args.max_length)
+
+    # Calculate class weights
+    labels = [item['label'] for item in train_dataset.data]
+    class_counts = np.bincount([train_dataset.tag_to_idx[l] for l in labels])
+    class_weights = 1. / (class_counts + 1e-6)
+    class_weights = class_weights / class_weights.sum()
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    dev_loader = DataLoader(
+        dev_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    # Model configuration
+    config = {
+        'vocab_size': len(train_dataset.char_to_idx),
+        'num_classes': len(train_dataset.tag_to_idx),
+        'embed_dim': args.embed_dim,
+        'hidden_dim': args.hidden_dim,
+        'num_layers': args.num_layers,
+        'dropout': args.dropout,
+        'lr': args.lr,
+        'weight_decay': args.weight_decay,
+        'class_weights': class_weights,
+        'label_smoothing': args.label_smoothing,
+        'grad_clip': args.grad_clip,
+        'use_amp': args.use_amp,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'idx_to_tag': {v: k for k, v in train_dataset.tag_to_idx.items()}
+    }
+
+    # Initialize trainer
+    trainer = Trainer(config)
+
+    # Training loop
+    for epoch in range(1, args.epochs + 1):
+        logger.info(f"Epoch {epoch}/{args.epochs}")
+        
+        # Train
+        train_loss = trainer.train_epoch(train_loader)
+        logger.info(f"Train Loss: {train_loss:.4f}")
+        
+        # Evaluate
+        accuracy, report, val_loss = trainer.evaluate(dev_loader)
+        logger.info(f"Val Loss: {val_loss:.4f} | Accuracy: {accuracy:.4f}")
+        logger.info(f"Classification Report:\n{json.dumps(report, indent=2)}")
+        
+        # Update learning rate
+        trainer.scheduler.step(accuracy)
+        
+        # Check for early stopping
+        if accuracy > trainer.best_accuracy:
+            trainer.best_accuracy = accuracy
+            trainer.early_stop_counter = 0
+            trainer.save_checkpoint('checkpoint.pt', is_best=True)
         else:
-            precision_scores[prediction_label] = 0.0
-    for target_label in tag_to_idx:
-        total = sum([confusion_matrix[target_label][k] for k in tag_to_idx])
-        if total != 0:
-            recall_scores[target_label] = float(confusion_matrix[target_label][target_label])/float(total)
-        else:
-            recall_scores[target_label] = 0.0
-    for label in tag_to_idx:
-        if precision_scores[label] == 0.0 and recall_scores[label] == 0.0:
-            f1_scores[label] = 0.0
-        else:
-            f1_scores[label] = \
-                2.0 * (precision_scores[label] * recall_scores[label]) / (precision_scores[label] + recall_scores[label])
+            trainer.early_stop_counter += 1
+            if trainer.early_stop_counter >= args.patience:
+                logger.info(f"Early stopping after {args.patience} epochs without improvement")
+                break
 
-    return dev_accuracy, confusion_matrix, precision_scores, recall_scores, f1_scores
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
