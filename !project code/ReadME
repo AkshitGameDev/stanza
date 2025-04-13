@@ -1,0 +1,16 @@
+how to run the project: 
+
+->  open command prompt and clone the repositiry
+
+-> install python liabrarys and dipendincy and open your VS code/jupyter/alaconda
+
+->  get in venv enviorment .\venv\Scripts\Activate.ps1
+
+-> select a database of choice (defalt: en_gum-ud-test-clean.conllu) change the name of the database in prep clean and run it in enviorment to test accuracy
+
+-> can run test_stanza to text pipelines and hyprparamertes
+
+-> Can run Process.py to run text and image generation.
+
+
+thanks

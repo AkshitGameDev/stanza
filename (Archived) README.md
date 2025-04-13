@@ -1,5 +1,5 @@
 
-<h1> please refer to other readme </h1>
+<h1> please refer to other readme in !project code </h1>
 
 <div align="center"><img src="https://github.com/stanfordnlp/stanza/raw/dev/images/stanza-logo.png" height="100px"/></div>
 
